@@ -90,6 +90,14 @@ class VideoInfo(BaseModel):
     upload_date: AwareDatetime = Field(description="Upload date of the video")
     duration: str = Field(description="Duration of the video")
 
+def _format_timed_transcript(title: str, snippets: list[TranscriptSnippet], next_cursor: str | None) -> str:
+    lines = [f"title: {title}", ""]
+    lines.append(f"snippets[{len(snippets)}]{{text,start,duration}}:")
+    for s in snippets:
+        lines.append(f"  {s.text},{s.start},{s.duration}")
+    if next_cursor:
+        lines.append(f"\nnext_cursor: {next_cursor}")
+    return "\n".join(lines)
 
 def _parse_time_info(date: int, timestamp: int, duration: int) -> Tuple[datetime, str]:
     parsed_date = datetime.strptime(str(date), "%Y%m%d").date()
@@ -220,14 +228,16 @@ def server(
         url: str = Field(description="The URL of the YouTube video"),
         lang: str = Field(description="The preferred language for the transcript", default="en"),
         next_cursor: str | None = Field(description="Cursor to retrieve the next page of the transcript", default=None),
-    ) -> TimedTranscript:
+    ) -> str:
         """Retrieves the transcript of a YouTube video with timestamps."""
 
         title, snippets = _get_transcript_snippets(ctx.request_context.lifespan_context, _parse_video_id(url), lang)
 
         if response_limit is None or response_limit <= 0:
-            return TimedTranscript(
-                title=title, snippets=[TranscriptSnippet.from_fetched_transcript_snippet(s) for s in snippets]
+            return _format_timed_transcript(
+                title,
+                [TranscriptSnippet.from_fetched_transcript_snippet(s) for s in snippets],
+                None
             )
 
         res = []
@@ -240,7 +250,7 @@ def server(
                 break
             res.append(snippet)
 
-        return TimedTranscript(title=title, snippets=res, next_cursor=cursor)
+        return _format_timed_transcript(title, res, cursor)
 
     @mcp.tool()
     def get_video_info(
