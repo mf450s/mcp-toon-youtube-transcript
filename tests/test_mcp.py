@@ -22,6 +22,32 @@ from yt_dlp.extractor.youtube import YoutubeIE
 from mcp_youtube_transcript import Transcript, VideoInfo, _parse_time_info, TimedTranscript, TranscriptSnippet
 
 
+def _parse_toon_transcript(text: str) -> TimedTranscript:
+    """Parst das kompakte toon-Format zurück in ein TimedTranscript."""
+    lines = text.strip().split("\n")
+    
+    title = lines[0].removeprefix("title: ")
+    # lines[1] ist leer, lines[2] ist z.B. "snippets[42]{text,start,duration}:"
+    snippets = []
+    for line in lines[3:]:
+        if line.startswith("next_cursor:"):
+            break
+        if not line.strip():
+            continue
+        parts = line.strip().split(",")
+        # text kann selbst Kommas enthalten → alles außer den letzten 2 ist text
+        text_part = ",".join(parts[:-2])
+        start = float(parts[-2])
+        duration = float(parts[-1])
+        snippets.append(TranscriptSnippet(text=text_part, start=start, duration=duration))
+    
+    next_cursor = None
+    for line in lines:
+        if line.startswith("next_cursor:"):
+            next_cursor = line.removeprefix("next_cursor: ").strip()
+    
+    return TimedTranscript(title=title, snippets=snippets, next_cursor=next_cursor)
+
 def fetch_title(url: str, lang: str) -> str:
     res = requests.get(f"https://www.youtube.com/watch?v={url}", headers={"Accept-Language": lang})
     soup = BeautifulSoup(res.text, "html.parser")
@@ -218,7 +244,7 @@ async def test_get_timed_transcript(mcp_client_session: ClientSession) -> None:
     )
     assert isinstance(res.content[0], TextContent)
 
-    transcript = TimedTranscript.model_validate_json(res.content[0].text)
+    transcript = _parse_toon_transcript(res.content[0].text)
     assert transcript == expect
     assert not res.isError
 
@@ -244,7 +270,7 @@ async def test_get_timed_transcript_with_language(mcp_client_session: ClientSess
     assert isinstance(res.content[0], TextContent)
     print(res.content[0].text)
 
-    transcript = TimedTranscript.model_validate_json(res.content[0].text)
+    transcript = _parse_toon_transcript(res.content[0].text)
     assert transcript == expect
     assert not res.isError
 
@@ -272,7 +298,7 @@ async def test_get_timed_transcript_fallback_language(
     )
     assert isinstance(res.content[0], TextContent)
 
-    transcript = TimedTranscript.model_validate_json(res.content[0].text)
+    transcript = _parse_toon_transcript(res.content[0].text)
     assert transcript == expect
     assert not res.isError
 
@@ -314,7 +340,7 @@ async def test_get_timed_transcript_with_short_url(mcp_client_session: ClientSes
     )
     assert isinstance(res.content[0], TextContent)
 
-    transcript = TimedTranscript.model_validate_json(res.content[0].text)
+    transcript = _parse_toon_transcript(res.content[0].text)
     assert transcript == expect
     assert not res.isError
 
@@ -341,7 +367,7 @@ async def test_get_timed_transcript_with_response_limit(mcp_client_session_with_
         assert not res.isError
         assert isinstance(res.content[0], TextContent)
 
-        t = TimedTranscript.model_validate_json(res.content[0].text)
+        t = _parse_toon_transcript(res.content[0].text)
         snippets.extend(t.snippets)
         if t.next_cursor is None:
             break
