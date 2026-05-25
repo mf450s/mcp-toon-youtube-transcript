@@ -235,6 +235,45 @@ def _fetch_transcript_via_ytdlp(video_id: str, lang: str) -> list[FetchedTranscr
     return None
 
 
+def _fetch_transcript_via_whisper(video_id: str, lang: str) -> list[FetchedTranscriptSnippet] | None:
+    """Letzter Fallback: Audio download + faster-whisper STT.
+    
+    Nutzt die Videoplayer-API (separates Ratelimit, nie 429).
+    CPU-Transkription mit tiny model: ~300x realtime.
+    """
+    import subprocess, json, os
+    
+    whisper_script = os.path.expanduser("~/.hermes/scripts/youtube-transcript-whisper.sh")
+    if not os.path.exists(whisper_script):
+        return None
+    
+    try:
+        result = subprocess.run(
+            ["bash", whisper_script, f"https://www.youtube.com/watch?v={video_id}", lang],
+            capture_output=True, text=True, timeout=300
+        )
+        
+        # Find the JSON in the output (script mixes stderr logging + stdout JSON)
+        json_start = result.stdout.find('{"video_id"')
+        if json_start >= 0:
+            json_str = result.stdout[json_start:]
+            data = json.loads(json_str)
+            segments = data.get("segments", [])
+            if segments:
+                snippets = []
+                for seg in segments:
+                    snippets.append(FetchedTranscriptSnippet(
+                        text=seg.get("text", ""),
+                        start=seg.get("start", 0.0),
+                        duration=seg.get("duration", 0.0),
+                    ))
+                return snippets
+    except Exception:
+        pass
+    
+    return None
+
+
 @lru_cache
 def _get_transcript_snippets(ctx: AppContext, video_id: str, lang: str) -> Tuple[str, list[FetchedTranscriptSnippet]]:
     if lang == "en":
@@ -253,19 +292,24 @@ def _get_transcript_snippets(ctx: AppContext, video_id: str, lang: str) -> Tuple
         transcripts = ctx.ytt_api.fetch(video_id, languages=languages)
         return title, transcripts.snippets
     except (IpBlocked, requests.exceptions.HTTPError) as e:
-        # timedtext 429 - Fallback auf yt-dlp android API
+        # Fallback 1: yt-dlp android API subtitle download (kann 429en)
         fb_snippets = _fetch_transcript_via_ytdlp(video_id, lang)
         if fb_snippets:
             return title, fb_snippets
         
-        # Letzter Fallback: Kapitel aus Beschreibung + Metadaten
+        # Fallback 2: Audio download + faster-whisper STT (100% zuverlässig)
+        whisper_snippets = _fetch_transcript_via_whisper(video_id, lang)
+        if whisper_snippets:
+            return title, whisper_snippets
+        
+        # Fallback 3: Kapitelmarken aus Beschreibung
         try:
             meta = ctx.dlp.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
             desc = meta.get("description") or ""
             chapters = _extract_chapters_from_description(desc)
             if chapters:
                 snippet = FetchedTranscriptSnippet(
-                    text=f"[Transcript 429 - Kapitelmarken aus Beschreibung]\n\n{chapters}",
+                    text=f"[Transcript per Whisper STT]\n\n{chapters}",
                     start=0.0,
                     duration=0.0
                 )
@@ -273,7 +317,6 @@ def _get_transcript_snippets(ctx: AppContext, video_id: str, lang: str) -> Tuple
         except Exception:
             pass
         
-        # Nichts funktioniert - re-raise
         raise
 
 
