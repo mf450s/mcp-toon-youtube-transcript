@@ -33,6 +33,12 @@ from mcp_youtube_transcript import server
 )
 @click.option("--http-proxy", metavar="URL", envvar="HTTP_PROXY", help="HTTP proxy server URL.")
 @click.option("--https-proxy", metavar="URL", envvar="HTTPS_PROXY", help="HTTPS proxy server URL.")
+@click.option(
+    "--po-token",
+    metavar="TOKEN",
+    envvar="YT_PO_TOKEN",
+    help="YouTube PO token to bypass 429 rate limiting. Use get-youtube-po-token.sh to generate one.",
+)
 @click.version_option()
 def main(
     response_limit: int | None,
@@ -40,6 +46,7 @@ def main(
     webshare_proxy_password: str | None,
     http_proxy: str | None,
     https_proxy: str | None,
+    po_token: str | None,
 ) -> None:
     """YouTube Transcript MCP server."""
 
@@ -47,5 +54,5 @@ def main(
     logger = logging.getLogger(__name__)
 
     logger.info("starting Youtube Transcript MCP server")
-    server(response_limit, webshare_proxy_username, webshare_proxy_password, http_proxy, https_proxy).run()
+    server(response_limit, webshare_proxy_username, webshare_proxy_password, http_proxy, https_proxy, po_token).run()
     logger.info("closed Youtube Transcript MCP server")

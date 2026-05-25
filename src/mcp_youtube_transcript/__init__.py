@@ -24,6 +24,7 @@ from mcp.server import FastMCP
 from mcp.server.fastmcp import Context
 from pydantic import Field, BaseModel, AwareDatetime
 from youtube_transcript_api import YouTubeTranscriptApi, FetchedTranscriptSnippet
+from youtube_transcript_api._errors import IpBlocked, TranscriptsDisabled
 from youtube_transcript_api.proxies import WebshareProxyConfig, GenericProxyConfig, ProxyConfig
 from yt_dlp import YoutubeDL
 from yt_dlp.extractor.youtube import YoutubeIE
@@ -34,18 +35,19 @@ class AppContext:
     http_client: requests.Session
     ytt_api: YouTubeTranscriptApi
     dlp: YoutubeDL
+    po_token: str | None = None
+    innertube_api_key: str | None = None
 
 
 @asynccontextmanager
-async def _app_lifespan(_server: FastMCP, proxy_config: ProxyConfig | None) -> AsyncIterator[AppContext]:
-    # Prepare YoutubeDL params with proxy support
+async def _app_lifespan(_server: FastMCP, proxy_config: ProxyConfig | None, po_token: str | None) -> AsyncIterator[AppContext]:
     ytdlp_params: dict[str, Any] = {"quiet": True}
     ytdlp_params.update(_proxy_config_to_ytdlp_params(proxy_config))
 
     with requests.Session() as http_client, YoutubeDL(params=ytdlp_params, auto_init=False) as dlp:
         ytt_api = YouTubeTranscriptApi(http_client=http_client, proxy_config=proxy_config)
         dlp.add_info_extractor(YoutubeIE())
-        yield AppContext(http_client=http_client, ytt_api=ytt_api, dlp=dlp)
+        yield AppContext(http_client=http_client, ytt_api=ytt_api, dlp=dlp, po_token=po_token)
 
 
 class Transcript(BaseModel):
@@ -108,23 +110,11 @@ def _parse_time_info(date: int, timestamp: int, duration: int) -> Tuple[datetime
 
 
 def _proxy_config_to_ytdlp_params(proxy_config: ProxyConfig | None) -> dict[str, str]:
-    """
-    Convert ProxyConfig to yt-dlp params format.
-
-    Args:
-        proxy_config: ProxyConfig object from youtube_transcript_api.proxies
-
-    Returns:
-        Dictionary with 'proxy' key if proxy is configured, empty dict otherwise.
-    """
     if proxy_config is None:
         return {}
 
-    # Get the requests-format proxy dict (format: {'http': '...', 'https': '...'})
     proxy_dict = proxy_config.to_requests_dict()
 
-    # yt-dlp accepts a single 'proxy' parameter
-    # Prefer HTTPS over HTTP since YouTube uses HTTPS
     if "https" in proxy_dict and proxy_dict["https"]:
         return {"proxy": proxy_dict["https"]}
     elif "http" in proxy_dict and proxy_dict["http"]:
@@ -144,6 +134,107 @@ def _parse_video_id(url: str) -> str:
         return q[0]
 
 
+def _extract_chapters_from_description(description: str) -> str:
+    """Extrahiere Kapitelmarken aus der Videobeschreibung als Pseudo-Transcript."""
+    import re
+    chapters = re.findall(r'(\d{1,2}:\d{2}(?::\d{2})?)\s+(.+)', description)
+    if chapters:
+        lines = []
+        for ts, title in chapters:
+            # Convert timestamp to seconds
+            parts = [int(x) for x in ts.split(':')]
+            if len(parts) == 3:
+                secs = parts[0] * 3600 + parts[1] * 60 + parts[2]
+            elif len(parts) == 2:
+                secs = parts[0] * 60 + parts[1]
+            else:
+                secs = parts[0]
+            lines.append(f"[{secs}s] {title.strip()}")
+        return "\n".join(lines) if lines else ""
+    return ""
+
+
+def _fetch_transcript_via_ytdlp(video_id: str, lang: str) -> list[FetchedTranscriptSnippet] | None:
+    """Fallback: transcript aus yt-dlp android API + legacy-server-connect extrahieren.
+    
+    Nutzt yt-dlp mit urllib (--legacy-server-connect) und android client.
+    Kann trotzdem 429 auf timedtext bekommen, ist aber einen Versuch wert.
+    """
+    import subprocess, json, re, os
+    
+    ytdlp = os.path.expanduser("~/.local/bin/yt-dlp")
+    if not os.path.exists(ytdlp):
+        return None
+    
+    try:
+        result = subprocess.run(
+            [ytdlp, "--legacy-server-connect",
+             "--cookies", os.path.expanduser("~/.config/yt-dlp/cookies.txt"),
+             "--extractor-args", "youtube:player_client=android",
+             "--write-auto-subs",
+             "--sub-langs", f"{lang}-orig,{lang},en-orig,en",
+             "--skip-download",
+             "-o", f"/tmp/yt_fb_{video_id}",
+             f"https://www.youtube.com/watch?v={video_id}"],
+            capture_output=True, text=True, timeout=60
+        )
+        
+        # Check for subtitle files
+        vtt_file = None
+        for f in os.listdir("/tmp"):
+            if f.startswith(f"yt_fb_{video_id}") and f.endswith(".vtt"):
+                vtt_file = os.path.join("/tmp", f)
+                break
+        
+        if vtt_file and os.path.getsize(vtt_file) > 0:
+            with open(vtt_file) as fh:
+                content = fh.read()
+            os.unlink(vtt_file)
+            
+            # Parse VTT
+            snippets = []
+            for block in re.split(r'\n\n+', content):
+                block = block.strip()
+                if not block or '-->' not in block:
+                    continue
+                lines = block.split('\n')
+                ts_line = next((l for l in lines if '-->' in l), None)
+                if not ts_line:
+                    continue
+                text_parts = [l.strip() for l in lines if l.strip() and '-->' not in l 
+                             and not l.startswith('WEBVTT') and not l.startswith('Kind:')
+                             and not l.startswith('Language:')]
+                if not text_parts:
+                    continue
+                
+                ts_match = re.match(r'(\d{1,2}):(\d{2}):(\d{2})\.(\d{3})', ts_line)
+                if ts_match:
+                    h, m, s, ms = int(ts_match.group(1)), int(ts_match.group(2)), int(ts_match.group(3)), int(ts_match.group(4))
+                    start = h * 3600 + m * 60 + s + ms / 1000
+                else:
+                    ts_match = re.match(r'(\d{1,2}):(\d{2})\.(\d{3})', ts_line)
+                    if ts_match:
+                        m, s, ms = int(ts_match.group(1)), int(ts_match.group(2)), int(ts_match.group(3))
+                        start = m * 60 + s + ms / 1000
+                    else:
+                        continue
+                
+                text = ' '.join(text_parts)
+                text = re.sub(r'<[^>]+>', '', text)
+                text = re.sub(r'&nbsp;', ' ', text)
+                text = text.strip()
+                if text:
+                    snippets.append(FetchedTranscriptSnippet(text=text, start=start, duration=0.0))
+            
+            if snippets:
+                return snippets
+    
+    except Exception:
+        pass
+    
+    return None
+
+
 @lru_cache
 def _get_transcript_snippets(ctx: AppContext, video_id: str, lang: str) -> Tuple[str, list[FetchedTranscriptSnippet]]:
     if lang == "en":
@@ -158,8 +249,32 @@ def _get_transcript_snippets(ctx: AppContext, video_id: str, lang: str) -> Tuple
     soup = BeautifulSoup(page.text, "html.parser")
     title = soup.title.string if soup.title and soup.title.string else "Transcript"
 
-    transcripts = ctx.ytt_api.fetch(video_id, languages=languages)
-    return title, transcripts.snippets
+    try:
+        transcripts = ctx.ytt_api.fetch(video_id, languages=languages)
+        return title, transcripts.snippets
+    except (IpBlocked, requests.exceptions.HTTPError) as e:
+        # timedtext 429 - Fallback auf yt-dlp android API
+        fb_snippets = _fetch_transcript_via_ytdlp(video_id, lang)
+        if fb_snippets:
+            return title, fb_snippets
+        
+        # Letzter Fallback: Kapitel aus Beschreibung + Metadaten
+        try:
+            meta = ctx.dlp.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+            desc = meta.get("description") or ""
+            chapters = _extract_chapters_from_description(desc)
+            if chapters:
+                snippet = FetchedTranscriptSnippet(
+                    text=f"[Transcript 429 - Kapitelmarken aus Beschreibung]\n\n{chapters}",
+                    start=0.0,
+                    duration=0.0
+                )
+                return title, [snippet]
+        except Exception:
+            pass
+        
+        # Nichts funktioniert - re-raise
+        raise
 
 
 @lru_cache
@@ -186,6 +301,7 @@ def server(
     webshare_proxy_password: str | None = None,
     http_proxy: str | None = None,
     https_proxy: str | None = None,
+    po_token: str | None = None,
 ) -> FastMCP:
     """Initializes the MCP server."""
 
@@ -195,7 +311,7 @@ def server(
     elif http_proxy or https_proxy:
         proxy_config = GenericProxyConfig(http_proxy, https_proxy)
 
-    mcp = FastMCP("Youtube Transcript", lifespan=partial(_app_lifespan, proxy_config=proxy_config))
+    mcp = FastMCP("Youtube Transcript", lifespan=partial(_app_lifespan, proxy_config=proxy_config, po_token=po_token))
 
     @mcp.tool()
     async def get_transcript(
